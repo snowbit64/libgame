@@ -15,329 +15,114 @@ on:
 jobs:
   decompile:
     runs-on: ubuntu-latest
+    permissions: # Necessário para criar Releases e comentar em PRs
+      contents: write
+      pull-requests: write
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
-          fetch-depth: 1
+          java-version: '17'
+          distribution: 'temurin'
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            default-jdk \
-            wget \
-            unzip \
-            binutils \
-            readelf \
-            objdump \
-            nm
+          sudo apt-get install -y wget unzip binutils readelf objdump nm radare2
 
       - name: Download Ghidra
         run: |
           GHIDRA_VERSION="11.0.3"
+          # Link direto e estável
           wget -q https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_20240410.zip
           unzip -q ghidra_${GHIDRA_VERSION}_PUBLIC_20240410.zip
-          rm ghidra_${GHIDRA_VERSION}_PUBLIC_20240410.zip
+          echo "GHIDRA_PATH=$PWD/ghidra_${GHIDRA_VERSION}_PUBLIC" >> $GITHUB_ENV
 
       - name: Analyze binary structure
         run: |
           mkdir -p analysis_report
+          FILE_PATH="${{ github.event.inputs.binary_path || 'libgame.so' }}"
+          echo "FILE_PATH=$FILE_PATH" >> $GITHUB_ENV
           
           echo "=== Binary Information ===" > analysis_report/binary_info.txt
-          file libgame.so >> analysis_report/binary_info.txt
-          echo "" >> analysis_report/binary_info.txt
-          
-          echo "=== Section Headers ===" >> analysis_report/binary_info.txt
-          readelf -S libgame.so >> analysis_report/binary_info.txt
-          echo "" >> analysis_report/binary_info.txt
-          
-          echo "=== Program Headers ===" >> analysis_report/binary_info.txt
-          readelf -l libgame.so >> analysis_report/binary_info.txt
-          echo "" >> analysis_report/binary_info.txt
-          
-          echo "=== Dynamic Symbols ===" >> analysis_report/binary_info.txt
-          readelf -sD libgame.so 2>/dev/null || nm -D libgame.so >> analysis_report/binary_info.txt
-          echo "" >> analysis_report/binary_info.txt
+          file "$FILE_PATH" >> analysis_report/binary_info.txt
+          readelf -h "$FILE_PATH" >> analysis_report/binary_info.txt
           
           echo "=== Exported Functions ===" >> analysis_report/binary_info.txt
-          nm libgame.so | grep ' T ' >> analysis_report/binary_info.txt || echo "No exported symbols found" >> analysis_report/binary_info.txt
+          nm -D "$FILE_PATH" || echo "No dynamic symbols" >> analysis_report/binary_info.txt
 
       - name: Create Ghidra decompilation script
         run: |
           cat > decompile_script.py << 'EOF'
+          from ghidra.app.decompiler import DecompInterface
+          from ghidra.util.task import ConsoleTaskMonitor
           import os
-          import json
-          from ghidra.program.model.address import AddressSet
-          from ghidra.program.model.listing import CodeUnit
-          
-          def get_function_info(func):
-              """Extract function information"""
-              info = {
-                  'name': func.getName(),
-                  'address': str(func.getEntryPoint()),
-                  'size': func.getBody().getNumAddresses(),
-                  'return_type': str(func.getReturnType()),
-                  'parameters': len(func.getParameters()),
-              }
-              return info
-          
-          def decompile_function(decompiler, func):
-              """Decompile a single function"""
-              try:
-                  decompiler.decompileFunction(func, 30, None)
-                  return decompiler.getDecompiledFunction()
-              except Exception as e:
-                  return None
-          
-          # Get current program
-          prog = currentProgram
-          
-          if prog is None:
-              print("ERROR: No program loaded")
-              exit(1)
-          
-          print(f"[*] Analyzing: {prog.getName()}")
-          print(f"[*] Architecture: {prog.getLanguage()}")
-          print(f"[*] Compiler Spec: {prog.getCompilerSpec()}")
-          
-          # Create output directory
+
+          # Configurar Decompilador
+          program = currentProgram
+          decomp_interface = DecompInterface()
+          decomp_interface.openProgram(program)
+
           output_dir = "decompiled_functions"
           if not os.path.exists(output_dir):
               os.makedirs(output_dir)
+
+          # Obter funções (Ghidra precisa ter analisado para popular isso)
+          functions = program.getFunctionManager().getFunctions(True)
           
-          # Initialize decompiler
-          from ghidra.app.decompiler import DecompilerFactory
-          decompiler = DecompilerFactory.getSingleton().getDecompiler(prog)
-          
-          # Get all functions
-          func_manager = prog.getFunctionManager()
-          functions = list(func_manager.getFunctions(True))
-          
-          print(f"[*] Found {len(functions)} functions")
-          
-          func_list = []
-          decompiled_count = 0
-          
-          for i, func in enumerate(functions):
-              func_info = get_function_info(func)
-              func_list.append(func_info)
-              
-              # Try to decompile
-              decomp_result = decompile_function(decompiler, func)
-              
-              if decomp_result:
-                  # Save decompiled code
-                  filename = os.path.join(output_dir, f"{func_info['address'].replace(':', '_')}__{func_info['name']}.c")
-                  with open(filename, 'w') as f:
-                      f.write(decomp_result.getDecompiledFunction().getC())
-                  decompiled_count += 1
+          count = 0
+          for func in functions:
+              # Ignorar funções externas/thunks se desejar
+              if func.isThunk():
+                  continue
                   
-                  if (i + 1) % 10 == 0:
-                      print(f"[+] Processed {i + 1}/{len(functions)} functions ({decompiled_count} decompiled)")
+              results = decomp_interface.decompileFunction(func, 0, ConsoleTaskMonitor())
+              if results.decompileCompleted():
+                  count += 1
+                  clean_name = func.getName().replace('<', '').replace('>', '')
+                  filename = "{}_{}.c".format(func.getEntryPoint(), clean_name)
+                  with open(os.path.join(output_dir, filename), "w") as f:
+                      f.write(results.getDecompiledFunction().getC())
           
-          # Save function list as JSON
-          with open("functions_list.json", 'w') as f:
-              json.dump(func_list, f, indent=2)
-          
-          print(f"\n[✓] Decompilation complete!")
-          print(f"[✓] Total functions: {len(functions)}")
-          print(f"[✓] Successfully decompiled: {decompiled_count}")
-          print(f"[✓] Output saved to: {output_dir}/")
+          print("Decompiladas {} funções.".format(count))
           EOF
-        
-        cat decompile_script.py
 
       - name: Run Ghidra headless decompilation
         run: |
-          GHIDRA_DIR=$(ls -d ghidra_* | head -1)
-          GHIDRA_HOME="$PWD/$GHIDRA_DIR"
+          # Aumentar memória para o Java (importante para arquivos .so grandes)
+          export _JAVA_OPTIONS="-Xmx4G"
           
-          # Create a temporary project
-          PROJECT_DIR="$PWD/ghidra_project"
-          mkdir -p "$PROJECT_DIR"
+          mkdir -p ghidra_project
           
-          echo "[*] Using Ghidra at: $GHIDRA_HOME"
-          echo "[*] Project directory: $PROJECT_DIR"
-          
-          # Run headless Ghidra
-          "$GHIDRA_HOME/support/analyzeHeadless" \
-              "$PROJECT_DIR" \
-              "libgame_analysis" \
-              -import "libgame.so" \
-              -scriptPath "." \
-              -postScript "decompile_script.py" \
+          # Removido o -noanalysis para permitir que o Ghidra identifique funções em arquivos stripped
+          $GHIDRA_PATH/support/analyzeHeadless \
+              ./ghidra_project \
+              TempProject \
+              -import "${{ env.FILE_PATH }}" \
+              -postScript decompile_script.py \
               -deleteProject \
-              -noanalysis || true
-          
-          # Check if decompilation was successful
-          if [ -d "decompiled_functions" ] && [ "$(ls -A decompiled_functions)" ]; then
-              echo "[✓] Decompilation successful!"
-              ls -lh decompiled_functions | head -20
-          else
-              echo "[!] No functions decompiled - trying alternative approach"
+              -analysisTimeoutPerFile 3600
+
+      - name: Fallback Radare2
+        if: always()
+        run: |
+          if [ ! -d "decompiled_functions" ] || [ -z "$(ls -A decompiled_functions)" ]; then
+            echo "Ghidra falhou ou não encontrou funções. Usando Radare2..."
+            mkdir -p radare2_analysis
+            r2 -qc "aaa; afl" "${{ env.FILE_PATH }}" > radare2_analysis/functions.txt
+            r2 -qc "aaa; iz" "${{ env.FILE_PATH }}" > radare2_analysis/strings.txt
           fi
 
-      - name: Fallback: Use Radare2 for analysis
-        if: failure() || hashFiles('decompiled_functions/*') == ''
-        run: |
-          sudo apt-get install -y radare2
-          
-          mkdir -p radare2_analysis
-          
-          echo "[*] Running Radare2 analysis..."
-          
-          # Generate JSON analysis
-          r2 -j -c "aaa;afj" libgame.so > radare2_analysis/functions.json 2>/dev/null || true
-          
-          # Generate detailed analysis
-          r2 -c "aaa;pdf" libgame.so > radare2_analysis/functions_detailed.txt 2>/dev/null || true
-          
-          # Generate strings
-          r2 -c "iz" libgame.so > radare2_analysis/strings.txt 2>/dev/null || true
-          
-          echo "[✓] Radare2 analysis complete"
-
-      - name: Generate summary report
-        run: |
-          cat > analysis_report/DECOMPILATION_SUMMARY.md << 'EOF'
-          # Decompilation Report for libgame.so
-          
-          ## Binary Information
-          - Generated: $(date)
-          - Binary: libgame.so
-          - Status: Analysis Complete
-          
-          ## Contents
-          
-          ### decompiled_functions/
-          Contains decompiled C source code for each identified function.
-          Naming format: `ADDRESS__FUNCTION_NAME.c`
-          
-          ### radare2_analysis/
-          Alternative analysis using Radare2:
-          - `functions.json`: Structured function list
-          - `functions_detailed.txt`: Detailed disassembly
-          - `strings.txt`: Extracted strings
-          
-          ### analysis_report/
-          - `binary_info.txt`: Binary structure details
-          - `functions_list.json`: Complete function inventory
-          
-          ## Notes
-          
-          - Stripped symbols were reconstructed from binary analysis
-          - Function names are derived from addresses and context
-          - Manual review recommended for critical functions
-          - See individual .c files for decompiled source code
-          
-          EOF
-          
-          cat analysis_report/DECOMPILATION_SUMMARY.md
-
-      - name: Create output artifact
-        if: always()
-        run: |
-          mkdir -p decompilation_output
-          
-          # Copy all analysis
-          [ -d "decompiled_functions" ] && cp -r decompiled_functions decompilation_output/ || true
-          [ -d "radare2_analysis" ] && cp -r radare2_analysis decompilation_output/ || true
-          [ -d "analysis_report" ] && cp -r analysis_report decompilation_output/ || true
-          [ -f "functions_list.json" ] && cp functions_list.json decompilation_output/ || true
-          
-          # Create index
-          cat > decompilation_output/INDEX.md << 'EOF'
-          # libgame.so Decompilation Results
-          
-          ## Directory Structure
-          
-          ```
-          decompilation_output/
-          ├── decompiled_functions/     # Decompiled C source files
-          ├── radare2_analysis/         # Radare2 analysis results
-          ├── analysis_report/          # Binary analysis reports
-          ├── functions_list.json       # Function inventory
-          └── INDEX.md                  # This file
-          ```
-          
-          ## Quick Start
-          
-          1. Review `analysis_report/binary_info.txt` for binary structure
-          2. Check `decompiled_functions/` for reconstructed source code
-          3. Use `functions_list.json` to find specific functions by address
-          
-          ## Tools Used
-          
-          - **Ghidra**: Primary decompilation engine
-          - **Radare2**: Fallback analysis and validation
-          - **readelf/nm/objdump**: Binary inspection
-          
-          EOF
-          
-          ls -lah decompilation_output/
-
-      - name: Upload decompilation results
-        if: always()
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: decompiled-libgame-so
-          path: decompilation_output/
-          retention-days: 90
-          if-no-files-found: warn
+          name: decompilation-results
+          path: |
+            decompiled_functions/
+            radare2_analysis/
+            analysis_report/
 
-      - name: Create GitHub Release with results
-        if: success()
-        uses: softprops/action-gh-release@v1
-        with:
-          files: decompilation_output/**/*
-          tag_name: decompile-${{ github.run_number }}
-          body: |
-            # libgame.so Decompilation Results
-            
-            Generated by automated analysis workflow.
-            
-            **Artifacts:**
-            - Decompiled functions in C
-            - Binary structure analysis
-            - Function inventory (JSON)
-            - Alternative Radare2 analysis
-            
-            Run #${{ github.run_number }}
-            Date: ${{ github.event.head_commit.timestamp }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Comment PR with results
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            
-            let comment = '## 📊 Decompilation Analysis Results\n\n';
-            
-            if (fs.existsSync('analysis_report/binary_info.txt')) {
-              comment += '### Binary Information\n```\n';
-              comment += fs.readFileSync('analysis_report/binary_info.txt', 'utf8').slice(0, 500);
-              comment += '\n...\n```\n\n';
-            }
-            
-            if (fs.existsSync('functions_list.json')) {
-              const funcs = JSON.parse(fs.readFileSync('functions_list.json', 'utf8'));
-              comment += `### Functions Found: ${funcs.length}\n`;
-              comment += `- First 5 functions:\n`;
-              funcs.slice(0, 5).forEach(f => {
-                comment += `  - ${f.name} @ ${f.address}\n`;
-              });
-            }
-            
-            comment += '\n📦 [Download full decompilation](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})';
-            
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: comment
-            });
