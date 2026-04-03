@@ -1,0 +1,151 @@
+name: Decompile Stripped Library
+
+on:
+  push:
+    paths:
+      - 'libgame.so'
+      - '.github/workflows/decompile-workflow.yml'
+  workflow_dispatch:
+    inputs:
+      binary_path:
+        description: 'Caminho para o arquivo .so'
+        required: false
+        default: 'libgame.so'
+
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Install Analysis Tools
+        run: |
+          sudo apt-get update
+          # binutils contém: readelf, nm, objdump
+          sudo apt-get install -y binutils radare2 wget unzip file
+
+      - name: Download Ghidra
+        run: |
+          GHIDRA_VERSION="11.0.3"
+          GHIDRA_ZIP="ghidra_${GHIDRA_VERSION}_PUBLIC_20240410.zip"
+          wget -q https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/$GHIDRA_ZIP
+          unzip -q $GHIDRA_ZIP
+          # Define o caminho absoluto para facilitar o uso nos próximos steps
+          echo "GHIDRA_PATH=$PWD/ghidra_${GHIDRA_VERSION}_PUBLIC" >> $GITHUB_ENV
+
+      - name: Prepare Environment
+        run: |
+          # Define o caminho do binário (prioriza input do usuário)
+          BINARY="${{ github.event.inputs.binary_path || 'libgame.so' }}"
+          echo "BINARY_FILE=$BINARY" >> $GITHUB_ENV
+          mkdir -p analysis_report decompiled_functions radare2_analysis
+
+      - name: Preliminary Binary Analysis
+        run: |
+          echo "=== Informações do Arquivo ===" > analysis_report/binary_info.txt
+          file "${{ env.BINARY_FILE }}" >> analysis_report/binary_info.txt
+          
+          echo "=== Cabeçalhos de Seção ===" >> analysis_report/binary_info.txt
+          readelf -S "${{ env.BINARY_FILE }}" >> analysis_report/binary_info.txt
+          
+          echo "=== Símbolos Dinâmicos ===" >> analysis_report/binary_info.txt
+          nm -D "${{ env.BINARY_FILE }}" >> analysis_report/binary_info.txt || echo "Sem símbolos dinâmicos." >> analysis_report/binary_info.txt
+
+      - name: Create Ghidra Script
+        run: |
+          cat > decompile_script.py << 'EOF'
+          from ghidra.app.decompiler import DecompInterface
+          from ghidra.util.task import ConsoleTaskMonitor
+          import os
+
+          # Inicializa interface de decompilação
+          program = currentProgram
+          decomp_interface = DecompInterface()
+          decomp_interface.openProgram(program)
+
+          output_dir = "decompiled_functions"
+          func_manager = program.getFunctionManager()
+          functions = func_manager.getFunctions(True)
+          
+          print("[*] Iniciando decompilação de funções...")
+          
+          count = 0
+          for func in functions:
+              if func.isThunk():
+                  continue
+              
+              results = decomp_interface.decompileFunction(func, 30, ConsoleTaskMonitor())
+              if results.decompileCompleted():
+                  count += 1
+                  # Limpa caracteres que o Windows/Linux podem rejeitar em nomes de arquivos
+                  clean_name = "".join([c for c in func.getName() if c.isalnum() or c in ('_','.')])
+                  filename = "{}_{}.c".format(func.getEntryPoint(), clean_name)
+                  
+                  with open(os.path.join(output_dir, filename), "w") as f:
+                      f.write(results.getDecompiledFunction().getC())
+          
+          print("[✓] Decompilação finalizada. {} funções salvas.".format(count))
+          EOF
+
+      - name: Run Ghidra Headless
+        run: |
+          # Aumenta memória Java para lidar com binários grandes
+          export _JAVA_OPTIONS="-Xmx4G"
+          
+          $GHIDRA_PATH/support/analyzeHeadless \
+              ./ghidra_project \
+              TempProject \
+              -import "${{ env.BINARY_FILE }}" \
+              -postScript decompile_script.py \
+              -deleteProject \
+              -analysisTimeoutPerFile 3600
+        continue-on-error: true
+
+      - name: Fallback Radare2 Analysis
+        if: always()
+        run: |
+          # Se a pasta estiver vazia, o Ghidra falhou em identificar as funções
+          if [ ! -d "decompiled_functions" ] || [ -z "$(ls -A decompiled_functions 2>/dev/null)" ]; then
+            echo "[!] Ghidra não produziu arquivos. Executando Radare2 como fallback..."
+            radare2 -qc "aaa; afl" "${{ env.BINARY_FILE }}" > radare2_analysis/functions_list.txt
+            radare2 -qc "aaa; iz" "${{ env.BINARY_FILE }}" > radare2_analysis/strings.txt
+            # Tenta gerar um dump de disassembly das funções encontradas
+            radare2 -qc "aaa; paf" "${{ env.BINARY_FILE }}" > radare2_analysis/disassembly.txt
+          else
+            echo "[✓] Ghidra gerou o código-fonte com sucesso."
+          fi
+
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysis-output
+          path: |
+            decompiled_functions/
+            radare2_analysis/
+            analysis_report/
+          retention-days: 30
+
+      - name: Create Release
+        if: success() && github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: decompile-v${{ github.run_number }}
+          files: |
+            analysis_report/binary_info.txt
+            radare2_analysis/*
+          body: "Resultados da análise automatizada para o arquivo ${{ env.BINARY_FILE }}."
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
